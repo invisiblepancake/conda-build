@@ -71,6 +71,7 @@ from .render import (
 )
 from .utils import (
     CONDA_PACKAGE_EXTENSIONS,
+    create_file_with_permissions,
     env_var,
     glob,
     on_mac,
@@ -1247,8 +1248,11 @@ def write_info_files_file(m, files):
 def write_link_json(m):
     package_metadata = OrderedDict()
     noarch_type = m.get_value("build/noarch")
-    if noarch_type:
-        noarch_type_str = str(noarch_type)
+    if noarch_type or m.python_version_independent:
+        if noarch_type:
+            noarch_type_str = str(noarch_type)
+        elif m.python_version_independent:
+            noarch_type_str = "python"
         noarch_dict = OrderedDict(type=noarch_type_str)
         if noarch_type_str.lower() == "python":
             entry_points = m.get_value("build/entry_points")
@@ -1441,13 +1445,14 @@ def create_info_files(m, replacements, files, prefix):
 
 
 def get_short_path(m, target_file):
+    if m.python_version_independent:
+        if (site_packages_idx := target_file.find("site-packages")) >= 0:
+            return target_file[site_packages_idx:]
     if m.noarch == "python":
         entry_point_script_names = get_entry_point_script_names(
             m.get_value("build/entry_points")
         )
-        if target_file.find("site-packages") >= 0:
-            return target_file[target_file.find("site-packages") :]
-        elif target_file.startswith("bin") and (
+        if target_file.startswith("bin") and (
             target_file not in entry_point_script_names
         ):
             return target_file.replace("bin", "python-scripts")
@@ -1665,6 +1670,9 @@ def post_process_files(m: MetaData, initial_prefix_files):
         noarch_python.populate_files(
             m, pkg_files, host_prefix, entry_point_script_names
         )
+    elif m.python_version_independent:
+        # For non noarch: python ones, we don't need to handle entry points in a special way.
+        noarch_python.populate_files(m, pkg_files, host_prefix, [])
 
     current_prefix_files = utils.prefix_files(prefix=host_prefix)
     new_files = current_prefix_files - initial_prefix_files
@@ -3036,7 +3044,7 @@ def _set_env_variables_for_build(m, env):
     # locally, and if we don't, it's a problem.
     env["PIP_NO_INDEX"] = True
 
-    if m.noarch == "python":
+    if m.python_version_independent:
         env["PYTHONDONTWRITEBYTECODE"] = True
 
     # The stuff in replacements is not parsable in a shell script (or we need to escape it)
@@ -3056,24 +3064,24 @@ def write_build_scripts(m, script, build_file):
 
     work_file = join(m.config.work_dir, "conda_build.sh")
     env_file = join(m.config.work_dir, "build_env_setup.sh")
-    with open(env_file, "w") as bf:
+
+    with create_file_with_permissions(env_file, 0o600) as bf:
         for k, v in env.items():
             if v != "" and v is not None:
                 bf.write(f'export {k}="{v}"\n')
-
         if m.activate_build_script:
             _write_sh_activation_text(bf, m)
-    with open(work_file, "w") as bf:
+
+    with create_file_with_permissions(work_file, 0o700) as bf:
         # bf.write('set -ex\n')
         bf.write("if [ -z ${CONDA_BUILD+x} ]; then\n")
-        bf.write(f"    source {env_file}\n")
+        bf.write(f"    source '{env_file}'\n")
         bf.write("fi\n")
         if script:
             bf.write(script)
         if isfile(build_file) and not script:
-            bf.write(open(build_file).read())
+            bf.write(Path(build_file).read_text())
 
-    os.chmod(work_file, 0o766)
     return work_file, env_file
 
 

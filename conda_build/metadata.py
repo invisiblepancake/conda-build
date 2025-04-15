@@ -20,7 +20,8 @@ import yaml
 from bs4 import UnicodeDammit
 from conda.base.context import locate_prefix_by_name
 from conda.gateways.disk.read import compute_sum
-from conda.models.match_spec import MatchSpec
+from conda.models.match_spec import GlobLowerStrMatch, MatchSpec
+from evalidate import EvalException, Expr, base_eval_model
 from frozendict import deepfreeze
 
 from . import utils
@@ -133,6 +134,13 @@ numpy_compatible_re = re.compile(r"pin_\w+\([\'\"]numpy[\'\"]")
 used_vars_cache = {}
 
 
+class OSModuleSubset:
+    "Subset of os module names commonly used in selectors"
+
+    environ = os.environ
+    getenv = os.getenv
+
+
 def get_selectors(config: Config) -> dict[str, bool]:
     """Aggregates selectors for use in recipe templating.
 
@@ -147,6 +155,7 @@ def get_selectors(config: Config) -> dict[str, bool]:
     """
     # Remember to update the docs of any of this changes
     plat = config.host_subdir
+
     d = dict(
         linux32=bool(plat == "linux-32"),
         linux64=bool(plat == "linux-64"),
@@ -154,8 +163,8 @@ def get_selectors(config: Config) -> dict[str, bool]:
         unix=plat.startswith(("linux-", "osx-", "emscripten-")),
         win32=bool(plat == "win-32"),
         win64=bool(plat == "win-64"),
-        os=os,
-        environ=os.environ,
+        os=OSModuleSubset,
+        environ=OSModuleSubset.environ,
         nomkl=bool(int(os.environ.get("FEATURE_NOMKL", False))),
     )
 
@@ -263,31 +272,70 @@ sel_pat = re.compile(r"(.+?)\s*(#.*)?\[([^\[\]]+)\](?(2)[^\(\)]*)$")
 # this function extracts the variable name from a NameError exception, it has the form of:
 # "NameError: name 'var' is not defined", where var is the variable that is not defined. This gets
 #    returned
-def parseNameNotFound(error):
-    m = re.search("'(.+?)'", str(error))
-    if len(m.groups()) == 1:
-        return m.group(1)
-    else:
+def parseNameNotFound(error) -> str:
+    message = str(error)
+    if isinstance(error, EvalException):
+        if message.endswith("is not allowed"):
+            return message.split()[-4]
         return ""
+    else:  # assume NameError-like
+        m = re.search("'(.+?)'", message)
+        if len(m.groups()) == 1:
+            return m.group(1)
+        else:
+            return ""
+
+
+@cache
+def evalidate_model():
+    model = base_eval_model.clone()
+    model.nodes.extend(["Call", "Attribute"])
+    model.allowed_functions += [
+        "int",
+        "str",
+        "list",
+        "dict",
+        "tuple",
+    ]
+    model.attributes += [
+        # string methods
+        "endswith",
+        "index",
+        "lower",
+        "rsplit",
+        "split",
+        "startswith",
+        "strip",
+        "upper",
+        # dict methods
+        "get",
+        "items",
+        "keys",
+        "values",
+        # for legacy os.environ and os.getenv
+        "environ",
+        "getenv",
+    ]
+    return model
 
 
 # We evaluate the selector and return True (keep this line) or False (drop this line)
 # If we encounter a NameError (unknown variable in selector), then we replace it by False and
 #     re-run the evaluation
-def eval_selector(selector_string, namespace, variants_in_place):
+def eval_selector(selector_string, namespace, variants_in_place, unsafe=False):
+    if unsafe:
+        expression = selector_string
+    else:
+        expression = Expr(selector_string.lstrip(), model=evalidate_model()).code
     try:
-        # TODO: is there a way to do this without eval?  Eval allows arbitrary
-        #    code execution.
-        return eval(selector_string, namespace, {})
+        return eval(expression, {}, namespace)
     except NameError as e:
         missing_var = parseNameNotFound(e)
         if variants_in_place:
             log = utils.get_logger(__name__)
-            log.debug(
-                "Treating unknown selector '" + missing_var + "' as if it was False."
-            )
+            log.debug("Treating unknown selector '%s' as if it was False.", missing_var)
         next_string = selector_string.replace(missing_var, "False")
-        return eval_selector(next_string, namespace, variants_in_place)
+        return eval_selector(next_string, namespace, variants_in_place, unsafe=unsafe)
 
 
 @cache
@@ -493,7 +541,9 @@ def ensure_matching_hashes(output_metadata):
                     if (
                         dep.startswith(m.name() + " ")
                         and len(dep.split(" ")) == 3
-                        and dep.split(" ")[-1] != m.build_id()
+                        and not GlobLowerStrMatch(dep.split(" ")[-1]).match(
+                            GlobLowerStrMatch(m.build_id())
+                        )
                         and _variants_equal(m, om)
                     ):
                         problemos.append((m.name(), m.build_id(), dep, om.name()))
@@ -606,6 +656,7 @@ FIELDS = {
         "script": list,
         "noarch": str,
         "noarch_python": bool,
+        "python_version_independent": bool,
         "has_prefix_files": None,
         "binary_has_prefix_files": None,
         "ignore_prefix_files": None,
@@ -1853,6 +1904,12 @@ class MetaData:
             build_noarch = self.get_value("build/noarch")
             if build_noarch:
                 d["noarch"] = build_noarch
+        elif self.python_version_independent:
+            # This is required by CEP 20 (https://github.com/conda/ceps/blob/main/cep-0020.md)
+            # to make current mamba/micromamba compile the pure python files
+            # and for micromamba to move the files in site-packages to the correct dir.
+            # (i.e. we need A2 action to apply actions B1-B4 as mentioned in CEP 20)
+            d["noarch"] = "python"
         if self.is_app():
             d.update(self.app_meta())
         return d
@@ -2228,6 +2285,15 @@ class MetaData:
         if not outputs:
             outputs = [{"name": self.name()}]
 
+        if len(output_matches) != len(outputs):
+            # See https://github.com/conda/conda-build/issues/5571
+            utils.get_logger(__name__).warning(
+                "Number of parsed outputs does not match detected raw metadata blocks. "
+                "Identified output block may be wrong! "
+                "If you are using Jinja conditionals to include or exclude outputs, "
+                "consider using `skip: true  # [condition]` instead."
+            )
+
         try:
             if output_type:
                 output_tuples = [
@@ -2250,7 +2316,8 @@ class MetaData:
         except ValueError:
             if not self.path and self.meta.get("extra", {}).get("parent_recipe"):
                 utils.get_logger(__name__).warning(
-                    f"Didn't match any output in raw metadata.  Target value was: {output_name}"
+                    "Didn't match any output in raw metadata. Target value was: %s",
+                    output_name,
                 )
                 output = ""
             else:
@@ -2324,6 +2391,18 @@ class MetaData:
             else CondaPkgFormat.V1,
         )
         return new
+
+    @property
+    def python_version_independent(self) -> bool:
+        return (
+            self.get_value("build/python_version_independent")
+            or self.get_value("build/noarch") == "python"
+            or self.noarch_python
+        )
+
+    @python_version_independent.setter
+    def python_version_independent(self, value: bool) -> None:
+        self.meta.setdefault("build", {})["python_version_independent"] = bool(value)
 
     @property
     def noarch(self):
@@ -2482,6 +2561,11 @@ class MetaData:
             output_metadata.final = False
             output_metadata.noarch = output.get("noarch", False)
             output_metadata.noarch_python = output.get("noarch_python", False)
+            output_metadata.python_version_independent = (
+                output.get("python_version_independent")
+                or output_metadata.noarch == "python"
+                or output_metadata.noarch_python
+            )
             # primarily for tests - make sure that we keep the platform consistent (setting noarch
             #      would reset it)
             if (

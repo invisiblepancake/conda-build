@@ -146,6 +146,21 @@ def test_recipe_builds(
     api.build(str(recipe), config=testing_config)
 
 
+@pytest.mark.slow
+@pytest.mark.serial
+def test_python_version_independent(
+    testing_config,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    recipe = os.path.join(metadata_dir, "_python_version_independent")
+    testing_config.activate = True
+    monkeypatch.setenv("CONDA_TEST_VAR", "conda_test")
+    monkeypatch.setenv("CONDA_TEST_VAR_2", "conda_test_2")
+    output = api.build(str(recipe), config=testing_config)[0]
+    subdir = os.path.basename(os.path.dirname(output))
+    assert subdir != "noarch"
+
+
 @pytest.mark.serial
 @pytest.mark.skipif(
     "CI" in os.environ and "GITHUB_WORKFLOW" in os.environ,
@@ -316,6 +331,7 @@ def test_output_build_path_git_source(testing_config):
 
 @pytest.mark.sanity
 @pytest.mark.serial
+@pytest.mark.flaky(reruns=5, reruns_delay=2)
 def test_build_with_no_activate_does_not_activate():
     api.build(
         os.path.join(metadata_dir, "_set_env_var_no_activate_build"),
@@ -474,6 +490,7 @@ def test_build_msvc_compiler(msvc_ver, monkeypatch):
 @pytest.mark.sanity
 @pytest.mark.parametrize("platform", platforms)
 @pytest.mark.parametrize("target_compiler", compilers)
+@pytest.mark.flaky(reruns=5, reruns_delay=2)
 def test_cmake_generator(platform, target_compiler, testing_config):
     testing_config.variant["python"] = target_compiler
     testing_config.activate = True
@@ -1421,7 +1438,7 @@ def test_recursion_layers(testing_config):
     reason="spaces break openssl prefix replacement on *nix",
 )
 @pytest.mark.skipif(
-    datetime.now() < datetime(2025, 1, 31),
+    datetime.now() < datetime(2025, 5, 31),
     reason="Unblock CI while https://github.com/mamba-org/mamba/issues/3730 gets a fix",
 )
 def test_croot_with_spaces(testing_metadata, testing_workdir):
@@ -1441,7 +1458,11 @@ def test_unknown_selectors(testing_config):
 def test_failed_recipe_leaves_folders(testing_config):
     recipe = os.path.join(fail_dir, "recursive-build")
     metadata = api.render(recipe, config=testing_config)[0][0]
-    locks = get_conda_operation_locks(metadata.config)
+    locks = get_conda_operation_locks(
+        metadata.config.locking,
+        metadata.config.bldpkgs_dirs,
+        metadata.config.timeout,
+    )
     with pytest.raises((RuntimeError, exceptions.DependencyNeedsBuildingError)):
         api.build(metadata)
     assert os.path.isdir(metadata.config.build_folder), "build folder was removed"
@@ -1791,6 +1812,7 @@ def test_overlinking_detection_ignore_patterns(
     rm_rf(dest_bat)
 
 
+@pytest.mark.flaky(reruns=5, reruns_delay=2)
 def test_overdepending_detection(testing_config, variants_conda_build_sysroot):
     testing_config.activate = True
     testing_config.error_overlinking = True
@@ -2102,3 +2124,73 @@ def test_api_build_inject_jinja2_vars_on_first_pass(testing_config):
 
     testing_config.variant = {"python_min": "3.12"}
     api.build(recipe_dir, config=testing_config)
+
+
+def test_ignore_run_exports_from_substr(tmp_path, capsys):
+    with tmp_path:
+        api.build(str(metadata_path / "ignore_run_exports_from_substr"))
+
+    assert "- python_abi " in capsys.readouterr().out
+
+
+@pytest.mark.skipif(not on_linux, reason="One platform is enough")
+def test_build_strings_glob_match(testing_config: Config) -> None:
+    """
+    Test issues observed in:
+    - https://github.com/conda/conda-build/issues/5571#issuecomment-2605223563
+    - https://github.com/conda-forge/conda-smithy/pull/2232#issuecomment-2618825581
+    - https://github.com/conda-forge/blas-feedstock/pull/132
+    - https://github.com/conda/conda-build/pull/5600
+    """
+    testing_config.channel_urls = ["conda-forge"]
+    with pytest.raises(RuntimeError, match="Could not download"):
+        # We expect an error fetching the license because we added a bad path on purpose
+        # so we don't start the actual build. However, this is enough to get us through
+        # the multi-output render phase where we examine compatibility of pins.
+        api.build(metadata_path / "_blas_pins", config=testing_config)
+
+
+@pytest.mark.skipif(not on_linux, reason="needs __glibc virtual package")
+def test_api_build_grpc_issue5645(tmp_path, testing_config):
+    if Version(conda_version) < Version("25.1.0"):
+        pytest.skip("needs conda 25.1.0")
+    testing_config.channel_urls = ["conda-forge"]
+    with tmp_path:
+        api.build(str(metadata_path / "_grpc"), config=testing_config)
+
+
+@pytest.mark.skipif(
+    not on_mac, reason="needs to cross-compile from osx-64 to osx-arm64"
+)
+def test_api_build_pytorch_cpu_issue5644(tmp_path, testing_config):
+    # this test has to cross-compile from osx-64 to osx-arm64
+    try:
+        if "CONDA_SUBDIR" in os.environ:
+            old_subdir = os.environ["CONDA_SUBDIR"]
+            has_old_subdir = True
+        else:
+            has_old_subdir = False
+            old_subdir = None
+        os.environ["CONDA_SUBDIR"] = "osx-64"
+
+        testing_config.channel_urls = ["conda-forge"]
+        with tmp_path:
+            api.build(str(metadata_path / "_pytorch_cpu"), config=testing_config)
+    finally:
+        if has_old_subdir:
+            os.environ["CONDA_SUBDIR"] = old_subdir
+        else:
+            del os.environ["CONDA_SUBDIR"]
+
+
+@pytest.mark.skipif(on_win, reason="file permissions not relevant on Windows")
+def test_build_script_permissions(testing_config):
+    recipe = os.path.join(metadata_dir, "_noarch_python")
+    metadata = api.render(
+        recipe, config=testing_config, dirty=True, remove_work_dir=False
+    )[0][0]
+    api.build(metadata, notest=True)
+    build_script = os.path.join(metadata.config.work_dir, "conda_build.sh")
+    assert (os.stat(build_script).st_mode & 0o777) == 0o700
+    env_script = os.path.join(metadata.config.work_dir, "build_env_setup.sh")
+    assert (os.stat(env_script).st_mode & 0o777) == 0o600

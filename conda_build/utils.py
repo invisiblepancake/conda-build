@@ -11,6 +11,7 @@ import logging.config
 import mmap
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -67,6 +68,7 @@ from conda.models.records import PackageRecord
 from conda.models.version import VersionOrder
 from conda.utils import unix_path_to_win
 
+from .deprecations import deprecated
 from .exceptions import BuildLockError
 
 if TYPE_CHECKING:
@@ -84,7 +86,12 @@ on_mac = sys.platform == "darwin"
 on_linux = sys.platform == "linux"
 
 codec = getpreferredencoding() or "utf-8"
-root_script_dir = os.path.join(context.root_prefix, "Scripts" if on_win else "bin")
+deprecated.constant(
+    "25.3",
+    "25.5",
+    "root_script_dir",
+    os.path.join(context.root_prefix, "Scripts" if on_win else "bin"),
+)
 mmap_MAP_PRIVATE = 0 if on_win else mmap.MAP_PRIVATE
 mmap_PROT_READ = 0 if on_win else mmap.PROT_READ
 mmap_PROT_WRITE = 0 if on_win else mmap.PROT_WRITE
@@ -670,6 +677,17 @@ def copytree(src, dst, symlinks=False, ignore=None, dry_run=False):
     return dst_lst
 
 
+def is_subdir(child, parent, strict=True):
+    """
+    Check whether child is a (strict) subdirectory of parent.
+    """
+    parent = Path(parent).resolve()
+    child = Path(child).resolve()
+    if strict:
+        return parent in child.parents
+    return child == parent or parent in child.parents
+
+
 def merge_tree(
     src, dst, symlinks=False, timeout=900, lock=None, locking=True, clobber=False
 ):
@@ -680,9 +698,7 @@ def merge_tree(
     Like copytree(src, dst), but raises an error if merging the two trees
     would overwrite any files.
     """
-    dst = os.path.normpath(os.path.normcase(dst))
-    src = os.path.normpath(os.path.normcase(src))
-    assert not dst.startswith(src), (
+    assert not is_subdir(dst, src, strict=False), (
         "Can't merge/copy source into subdirectory of itself.  "
         "Please create separate spaces for these things.\n"
         f"  src: {src}\n"
@@ -1060,6 +1076,7 @@ def iter_entry_points(items):
 
 
 def create_entry_point(path, module, func, config):
+    """Creates an entry point for legacy noarch_python builds"""
     import_name = func.split(".")[0]
     pyscript = PY_TMPL % {"module": module, "func": func, "import_name": import_name}
     if on_win:
@@ -1083,6 +1100,7 @@ def create_entry_point(path, module, func, config):
 
 
 def create_entry_points(items, config):
+    """Creates entry points for legacy noarch_python builds"""
     if not items:
         return
     bin_dir = join(config.host_prefix, bin_dirname)
@@ -2092,7 +2110,9 @@ def compute_content_hash(
 def write_bat_activation_text(file_handle, m):
     from .os_utils.external import find_executable
 
-    file_handle.write(f'call "{root_script_dir}\\..\\condabin\\conda_hook.bat"\n')
+    file_handle.write(f'call "{context.root_prefix}\\condabin\\conda_hook.bat"\n')
+    for key, value in context.conda_exe_vars_dict.items():
+        file_handle.write(f'set "{key}={value or ""}"\n')
     if m.is_cross:
         # HACK: we need both build and host envs "active" - i.e. on PATH,
         #     and with their activate.d scripts sourced. Conda only
@@ -2117,12 +2137,12 @@ def write_bat_activation_text(file_handle, m):
             open(history_file, "a").close()
 
         file_handle.write(
-            f'call "{root_script_dir}\\..\\condabin\\conda.bat" activate "{m.config.host_prefix}"\n'
+            f'call "{context.root_prefix}\\condabin\\conda.bat" activate "{m.config.host_prefix}"\n'
         )
 
     # Write build prefix activation AFTER host prefix, so that its executables come first
     file_handle.write(
-        f'call "{root_script_dir}\\..\\condabin\\conda.bat" activate --stack "{m.config.build_prefix}"\n'
+        f'call "{context.root_prefix}\\condabin\\conda.bat" activate --stack "{m.config.build_prefix}"\n'
     )
 
     ccache = find_executable("ccache", m.config.build_prefix, False)
@@ -2241,3 +2261,39 @@ def is_conda_pkg(pkg_path: str) -> bool:
 
 def package_record_to_requirement(prec: PackageRecord) -> str:
     return f"{prec.name} {prec.version} {prec.build}"
+
+
+@contextlib.contextmanager
+def set_umask(mask: int = 0) -> Iterable[None]:
+    current = os.umask(mask)
+    yield
+    os.umask(current)
+
+
+@contextlib.contextmanager
+def create_file_with_permissions(path: str, permissions: int):
+    """
+    Opens a new file for writing, with permissions set from creation time.
+    This is achieved by creating a temporary directory in the same parent
+    directory, opening a new file inside with the right permissions,
+    yielding the descriptor so the caller can add the necessary contents,
+    and then moving the temporary file to the target location, with preserved
+    permissions.
+
+    The umask is temporarily reset during this process, and then restored.
+    This is needed so permissions can be applied as intended. Without a zeroed
+    umask, the system umask might filter the passed value to a different one.
+    For example, given a system umask=022, passing 666 will result in a file
+    with permissions 644.
+    """
+
+    def opener(path, flags):
+        return os.open(path, flags, mode=permissions)
+
+    dirname = os.path.dirname(path)
+    with set_umask(), TemporaryDirectory(dir=dirname) as tmpdir:
+        tmp_path = os.path.join(tmpdir, secrets.token_urlsafe(64))
+        with open(tmp_path, "w", opener=opener) as fh:
+            yield fh
+
+        shutil.move(tmp_path, path)

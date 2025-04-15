@@ -4,7 +4,7 @@
 
 ### Bug fixes
 
-* Fixes transitive subpackage dependency resolution issue #3308. (#5603)
+*
 
 ### Deprecations
 
@@ -12,7 +12,7 @@
 
 ### Docs
 
-* <news item>
+* Add recommendation to append build number to build string when overwriting build string. (#5676)
 
 ### Other
 

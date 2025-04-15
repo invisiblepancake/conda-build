@@ -1,6 +1,7 @@
 ### Enhancements
 
-* Add `cdt_arch` and `cdt_name` as used vars when cdt jinja is used. (#5599)
+* Ignore run_exports of python from other packages when building with
+  ``python_version_independent: true`` (#5654).
 
 ### Bug fixes
 

@@ -8,7 +8,7 @@ source:
   git_url: ../
 
 build:
-  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -vv
+  script: {{ PYTHON }} -m pip install . -vv
   entry_points:
     - conda-build = conda_build.cli.main_build:execute
     - conda-convert = conda_build.cli.main_convert:execute
@@ -34,6 +34,7 @@ requirements:
     - conda >=23.7.0
     - conda-index >=0.4.0
     - conda-package-handling >=2.2.0
+    - evalidate >=2,<3.0a0
     - filelock
     - frozendict >=2.4.2
     - jinja2
@@ -42,7 +43,10 @@ requirements:
     - menuinst >=2
     - packaging
     - patch >=2.6                  # [not win]
-    - patchelf                     # [linux]
+    # Cap to avoid bug where ELF load command is garbled.
+    # xref: https://github.com/conda/conda-build/issues/4881
+    # xref: https://github.com/NixOS/patchelf/issues/492
+    - patchelf <0.18               # [linux]
     - pkginfo
     - psutil
     - py-lief
@@ -51,6 +55,7 @@ requirements:
     - pytz
     - pyyaml
     - requests
+    - evalidate >=2,<3.0a0
     - tomli                        # [py<311]
     - tqdm
   run_constrained:
